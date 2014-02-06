@@ -45,8 +45,8 @@ def get_classrefs(elf):
 #    return get_list(elf, '__DATA, __objc_nlcatlist, regular, no_dead_strip')
 
 
-def from_ptr(stream, offset, cls):
-    return None if offset == 0 else cls(stream, offset)
+def from_ptr(stream, offset, cls, default=None):
+    return default if offset == 0 else cls(stream, offset)
 
 
 class ObjCClass(object):
@@ -71,9 +71,9 @@ class ObjCClassRO(object):
         self.instanceSize = fields[2]
         self.ivarLayout = fields[3]
         self.name = read_string(stream, fields[4])
-        self.baseMethods = from_ptr(stream, fields[5], ObjCMethodList)
+        self.baseMethods = from_ptr(stream, fields[5], ObjCMethodList, [])
         self.baseProtocols = fields[6]
-        self.ivars = fields[7]
+        self.ivars = from_ptr(stream, fields[7], ObjCIVarList, [])
         self.weakIvarLayout = fields[8]
         self.properties = fields[9]
 
@@ -94,6 +94,25 @@ class ObjCMethod(object):
     def __repr__(self):
         return self.cmd
 
+class ObjCIVarList(list):
+    def __init__(self, stream, offset):
+        stream.seek(offset)
+        entsize, ivar_count = read_words(stream, 2)
+        for i in range(ivar_count):
+            self.append(ObjCIVar(stream, offset+8+i*entsize))
+
+class ObjCIVar(object):
+    def __init__(self, stream, offset):
+        stream.seek(offset)
+        fields = read_words(stream, 5)
+        self.offset = fields[0]
+        self.name = read_string(stream, fields[1])
+        self.type = read_string(stream, fields[2])
+        self.alignment = fields[3]
+        self.size = fields[4]
+    def __repr__(self):
+        return self.name
+
 def decompile(stream):
     elf = ELFFile(stream)
     #symbols = elf.get_section_by_name('.dynsym').iter_symbols()
@@ -104,8 +123,8 @@ def decompile(stream):
     classlist = get_classlist(elf)
     for off in classlist:
         cls = ObjCClass(stream, off)
-        if 'AddNewDots' in cls.ro.name:
-            print cls.ro.baseMethods
+        if 'DotsGameBoard' == cls.ro.name:
+            print cls, cls.ro.ivars
 
 
 
