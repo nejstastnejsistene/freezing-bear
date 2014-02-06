@@ -58,6 +58,10 @@ class ObjCClass(object):
         self.cache = fields[2]
         self.vtable = fields[3]
         self.ro = from_ptr(stream, fields[4], ObjCClassRO)
+
+    def __getattr__(self, name):
+        return getattr(self.ro, name)
+
     def __repr__(self):
         return self.ro.name
 
@@ -76,6 +80,14 @@ class ObjCClassRO(object):
         self.ivars = from_ptr(stream, fields[7], ObjCIVarList, [])
         self.weakIvarLayout = fields[8]
         self.properties = fields[9]
+    def __getattr__(self, name):
+        for ivar in self.ivars:
+            if ivar.name == name:
+                return ivar
+        for method in self.baseMethods:
+            if method.cmd == name:
+                return method
+        raise AttributeError, name
 
 class ObjCMethodList(list):
     def __init__(self, stream, offset):
@@ -123,8 +135,8 @@ def decompile(stream):
     classlist = get_classlist(elf)
     for off in classlist:
         cls = ObjCClass(stream, off)
-        if 'DotsGameBoard' == cls.ro.name:
-            print cls, cls.ro.ivars
+        if 'AddNew' in cls.name:
+            print cls.super.getRandomDotClass.method_type
 
 
 
