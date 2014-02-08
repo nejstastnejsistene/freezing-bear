@@ -1,10 +1,39 @@
 import struct
 from elftools.elf.elffile import ELFFile
 
+
+classlist_section_name = '__DATA, __objc_classlist, regular, no_dead_strip'
+
+
+offset_cache = {}
+
+def lookup(stream, offset, cls=None):
+    if offset not in offset_cache:
+        if cls is None:
+            raise KeyError, offset
+        offset_cache[offset] = cls(stream, offset)
+    return offset_cache[offset]
+
+
 def read_words(stream, n=1):
     return struct.unpack('I'*n, stream.read(4*n))
 
-def read_string(stream, offset):
+
+def _get_list(elf, section_name, cls):
+    section = elf.get_section_by_name(section_name)
+    section.stream.seek(section.header.sh_offset)
+    num_items = section.header.sh_size / section.header.sh_addralign
+    items = read_words(section.stream, num_items)
+    assert items[0] == 0xffffffff and items[-1] == 0
+    return (lookup(section.stream, offset, cls) for offset in items[1:-1])
+
+
+def get_classlist(elf):
+    '''Pointers to class structs in __objc_data.'''
+    return _get_list(elf, classlist_section_name, Class)
+
+
+def String(stream, offset):
     stream.seek(offset)
     chars = []
     while True:
@@ -15,49 +44,45 @@ def read_string(stream, offset):
             chars.append(ch)
 
 
-def get_list(elf, section_name):
-    section = elf.get_section_by_name(section_name)
-    section.stream.seek(section.header.sh_offset)
-    num_items = section.header.sh_size / section.header.sh_addralign
-    items = read_words(section.stream, num_items)
-    assert items[0] == 0xffffffff and items[-1] == 0
-    return items[1:-1]
+class List(list):
 
+    _default = []
 
-def get_classlist(elf):
-    '''Pointers to class structs in __objc_data.'''
-    return get_list(elf, '__DATA, __objc_classlist, regular, no_dead_strip')
-
-def get_classrefs(elf):
-    '''References pointing to an entry in the classlist.'''
-    return get_list(elf, '__DATA, __objc_classrefs, regular, no_dead_strip')
-
-#def get_nlclslist(elf):
-#    return get_list(elf, '__DATA, __objc_nlclslist, regular, no_dead_strip')
-
-#def get_catlist(elf):
-#    return get_list(elf, '__DATA, __objc_catlist, regular, no_dead_strip')
-
-#def get_protolist(elf):
-#    return get_list(, '__DATA, __objc_protolist, coalesced, no_dead_strip')
-
-#def get_nlcatlist(elf):
-#    return get_list(elf, '__DATA, __objc_nlcatlist, regular, no_dead_strip')
-
-
-def from_ptr(stream, offset, cls, default=None):
-    return default if offset == 0 else cls(stream, offset)
-
-
-class ObjCClass(object):
-    def __init__(self, stream, offset):
+    def __init__(self, stream, offset, cls):
         stream.seek(offset)
-        fields = read_words(stream, 5)
-        self.isa = from_ptr(stream, fields[0], ObjCClass)
-        self.super = from_ptr(stream, fields[1], ObjCClass)
-        self.cache = fields[2]
-        self.vtable = fields[3]
-        self.ro = from_ptr(stream, fields[4], ObjCClassRO)
+        entsize, count = read_words(stream, 2)
+        for i in range(count):
+            self.append(cls(stream, offset + 8 + i * entsize))
+
+
+class Struct(object):
+
+    _default = None
+
+    def __init__(self, stream, offset, fields):
+        self._stream = stream
+        self._offset = offset
+        stream.seek(offset)
+        values = read_words(stream, len(fields))
+        for pair, value in zip(fields, values):
+            name, cls = pair
+            if cls is not None:
+                if value == 0:
+                    value = getattr(self, '_default', None)
+                else:
+                    value = lookup(stream, value, cls)
+            setattr(self, name, value)
+
+
+class Class(Struct):
+
+    def __init__(self, stream, offset):
+        Struct.__init__(self, stream, offset, \
+                [('isa', Class)
+                ,('super', Class)
+                ,('cache', None)
+                ,('vtable', None)
+                ,('ro', ClassRO)])
 
     def __getattr__(self, name):
         return getattr(self.ro, name)
@@ -66,20 +91,21 @@ class ObjCClass(object):
         return self.ro.name
 
 
-class ObjCClassRO(object):
+class ClassRO(Struct):
+
     def __init__(self, stream, offset):
-        stream.seek(offset)
-        fields = read_words(stream, 10)
-        self.flags = fields[0]
-        self.instanceStart = fields[1]
-        self.instanceSize = fields[2]
-        self.ivarLayout = fields[3]
-        self.name = read_string(stream, fields[4])
-        self.baseMethods = from_ptr(stream, fields[5], ObjCMethodList, [])
-        self.baseProtocols = fields[6]
-        self.ivars = from_ptr(stream, fields[7], ObjCIVarList, [])
-        self.weakIvarLayout = fields[8]
-        self.properties = fields[9]
+        Struct.__init__(self, stream, offset, \
+                [('flags', None)
+                ,('instanceStart', None)
+                ,('instanceSize', None)
+                ,('ivarLayout', None)
+                ,('name', String)
+                ,('baseMethods', MethodList)
+                ,('baseProtocols', None)
+                ,('ivars', IVarList)
+                ,('weakIvarLayout', None)
+                ,('properties', None)])
+
     def __getattr__(self, name):
         for ivar in self.ivars:
             if ivar.name == name:
@@ -89,41 +115,39 @@ class ObjCClassRO(object):
                 return method
         raise AttributeError, name
 
-class ObjCMethodList(list):
+class MethodList(List):
     def __init__(self, stream, offset):
-        stream.seek(offset)
-        entsize, method_count = read_words(stream, 2)
-        for i in range(method_count):
-            self.append(ObjCMethod(stream, offset + 8 + i * entsize))
+        List.__init__(self, stream, offset, Method)
 
-class ObjCMethod(object):
+
+class Method(Struct):
+
     def __init__(self, stream, offset):
-        stream.seek(offset)
-        fields = read_words(stream, 3)
-        self.cmd = read_string(stream, fields[0])
-        self.method_type = read_string(stream, fields[1])
-        self.imp = fields[2]
+        Struct.__init__(self, stream, offset,
+                [('cmd', String)
+                ,('method_type', String)
+                ,('imp', None)])
+
     def __repr__(self):
         return self.cmd
 
-class ObjCIVarList(list):
+class IVarList(List):
     def __init__(self, stream, offset):
-        stream.seek(offset)
-        entsize, ivar_count = read_words(stream, 2)
-        for i in range(ivar_count):
-            self.append(ObjCIVar(stream, offset+8+i*entsize))
+        List.__init__(self, stream, offset, IVar)
 
-class ObjCIVar(object):
+
+class IVar(Struct):
     def __init__(self, stream, offset):
-        stream.seek(offset)
-        fields = read_words(stream, 5)
-        self.offset = fields[0]
-        self.name = read_string(stream, fields[1])
-        self.type = read_string(stream, fields[2])
-        self.alignment = fields[3]
-        self.size = fields[4]
+        Struct.__init__(self, stream, offset,
+                [('offset', None)
+                ,('name', String)
+                ,('type', String)
+                ,('alignment', None)
+                ,('size', None)])
+
     def __repr__(self):
         return self.name
+
 
 def decompile(stream):
     elf = ELFFile(stream)
@@ -133,11 +157,9 @@ def decompile(stream):
     #assert objc_data is not None
 
     classlist = get_classlist(elf)
-    for off in classlist:
-        cls = ObjCClass(stream, off)
+    for cls in get_classlist(elf):
         if 'AddNew' in cls.name:
             print cls.super.getRandomDotClass.method_type
-
 
 
     #start = objc_data.header.sh_offset
