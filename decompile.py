@@ -1,5 +1,7 @@
 import struct
 from collections import defaultdict
+
+import darm
 from elftools.elf.elffile import ELFFile
 
 
@@ -23,8 +25,12 @@ class FreezingBear(object):
             self.by_class[cls].append(obj)
         return self.by_offset[offset]
 
-    def read_words(self, n=1):
+    def read(self, n=1):
         return struct.unpack('I'*n, self.stream.read(4*n))
+
+    def read_at(self, offset, n=1):
+        self.stream.seek(offset)
+        return self.read(n)
 
     def get_classlist(self):
         section = self.elf.get_section_by_name(classlist_section_name)
@@ -34,15 +40,14 @@ class FreezingBear(object):
 class PointerList(list):
     
     def __init__(self, bear, offset, cls):
-        bear.stream.seek(offset)
-        ptr = bear.read_words()[0]
+        ptr, = bear.read_at(offset)
         assert ptr == 0xffffffff
-        ptr = bear.read_words()[0]
+        offset += 4
+        ptr, = bear.read_at(offset)
         while ptr != 0:
             self.append(bear.lookup(ptr, cls))
             offset += 4
-            bear.stream.seek(offset)
-            ptr = bear.read_words()[0]
+            ptr, = bear.read_at(offset)
 
 
 class ClassList(PointerList):
@@ -66,8 +71,7 @@ class PropertyList(list):
     _default = []
 
     def __init__(self, bear, offset, cls):
-        bear.stream.seek(offset)
-        entsize, count = bear.read_words(2)
+        entsize, count = bear.read_at(offset, 2)
         for i in range(count):
             self.append(bear.lookup(offset + 8 + i * entsize, cls))
 
@@ -77,8 +81,7 @@ class Struct(object):
     _default = None
 
     def __init__(self, bear, offset, fields):
-        bear.stream.seek(offset)
-        values = bear.read_words(len(fields))
+        values = bear.read_at(offset, len(fields))
         for pair, value in zip(fields, values):
             name, cls = pair
             if cls is not None:
@@ -149,6 +152,7 @@ class Method(Struct):
     def __repr__(self):
         return self.cmd
 
+
 class IVarList(PropertyList):
     def __init__(self, bear, offset):
         PropertyList.__init__(self, bear, offset, IVar)
@@ -170,7 +174,16 @@ class IVar(Struct):
 def decompile(bear):
     criteria = lambda x: 'AddNew' in x.name and not x.is_metaclass()
     cls, = filter(criteria, bear.by_class[Class])
-    print hex(cls.super.getRandomDotClass.imp)
+    offset = cls.super.getRandomDotClass.imp
+
+    registers = [0]*16
+    while True:
+        instr = darm.disasm_armv7(bear.read_at(offset)[0])
+        offset += 4
+
+        print hex(offset), instr
+        if str(instr.instr) == 'POP':
+            break
 
 
 if __name__ == '__main__':
