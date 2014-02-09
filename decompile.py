@@ -1,88 +1,106 @@
 import struct
+from collections import defaultdict
 from elftools.elf.elffile import ELFFile
 
 
 classlist_section_name = '__DATA, __objc_classlist, regular, no_dead_strip'
 
+class FreezingBear(object):
 
-offset_cache = {}
+    def __init__(self, stream):
+        self.stream = stream
+        self.elf = ELFFile(stream)
+        self.by_offset = {}
+        self.by_class = defaultdict(lambda: [])
+        self.get_classlist()
 
-def lookup(stream, offset, cls=None):
-    if offset not in offset_cache:
-        if cls is None:
-            raise KeyError, offset
-        offset_cache[offset] = cls(stream, offset)
-    return offset_cache[offset]
+    def lookup(self, offset, cls=None):
+        if offset not in self.by_offset:
+            if cls is None:
+                raise KeyError, offset
+            obj = cls(self, offset)
+            self.by_offset[offset] = obj
+            self.by_class[cls].append(obj)
+        return self.by_offset[offset]
 
+    def read_words(self, n=1):
+        return struct.unpack('I'*n, self.stream.read(4*n))
 
-def read_words(stream, n=1):
-    return struct.unpack('I'*n, stream.read(4*n))
-
-
-def _get_list(elf, section_name, cls):
-    section = elf.get_section_by_name(section_name)
-    section.stream.seek(section.header.sh_offset)
-    num_items = section.header.sh_size / section.header.sh_addralign
-    items = read_words(section.stream, num_items)
-    assert items[0] == 0xffffffff and items[-1] == 0
-    return (lookup(section.stream, offset, cls) for offset in items[1:-1])
-
-
-def get_classlist(elf):
-    '''Pointers to class structs in __objc_data.'''
-    return _get_list(elf, classlist_section_name, Class)
+    def get_classlist(self):
+        section = self.elf.get_section_by_name(classlist_section_name)
+        return self.lookup(section.header.sh_offset, ClassList)
 
 
-def String(stream, offset):
-    stream.seek(offset)
+class PointerList(list):
+    
+    def __init__(self, bear, offset, cls):
+        bear.stream.seek(offset)
+        ptr = bear.read_words()[0]
+        assert ptr == 0xffffffff
+        ptr = bear.read_words()[0]
+        while ptr != 0:
+            self.append(bear.lookup(ptr, cls))
+            offset += 4
+            bear.stream.seek(offset)
+            ptr = bear.read_words()[0]
+
+
+class ClassList(PointerList):
+    def __init__(self, bear, offset):
+        PointerList.__init__(self, bear, offset, Class)
+
+
+def String(bear, offset):
+    bear.stream.seek(offset)
     chars = []
     while True:
-        ch = stream.read(1)
+        ch = bear.stream.read(1)
         if ch == '\0':
             return ''.join(chars)
         else:
             chars.append(ch)
 
 
-class List(list):
+class PropertyList(list):
 
     _default = []
 
-    def __init__(self, stream, offset, cls):
-        stream.seek(offset)
-        entsize, count = read_words(stream, 2)
+    def __init__(self, bear, offset, cls):
+        bear.stream.seek(offset)
+        entsize, count = bear.read_words(2)
         for i in range(count):
-            self.append(cls(stream, offset + 8 + i * entsize))
+            self.append(bear.lookup(offset + 8 + i * entsize, cls))
 
 
 class Struct(object):
 
     _default = None
 
-    def __init__(self, stream, offset, fields):
-        self._stream = stream
-        self._offset = offset
-        stream.seek(offset)
-        values = read_words(stream, len(fields))
+    def __init__(self, bear, offset, fields):
+        bear.stream.seek(offset)
+        values = bear.read_words(len(fields))
         for pair, value in zip(fields, values):
             name, cls = pair
             if cls is not None:
                 if value == 0:
                     value = getattr(self, '_default', None)
                 else:
-                    value = lookup(stream, value, cls)
+                    value = bear.lookup(value, cls)
             setattr(self, name, value)
 
 
 class Class(Struct):
 
-    def __init__(self, stream, offset):
-        Struct.__init__(self, stream, offset, \
+    def __init__(self, bear, offset):
+        Struct.__init__(self, bear, offset, \
                 [('isa', Class)
                 ,('super', Class)
                 ,('cache', None)
                 ,('vtable', None)
                 ,('ro', ClassRO)])
+
+    def is_metaclass(self):
+        return self.isa is None
 
     def __getattr__(self, name):
         return getattr(self.ro, name)
@@ -93,8 +111,8 @@ class Class(Struct):
 
 class ClassRO(Struct):
 
-    def __init__(self, stream, offset):
-        Struct.__init__(self, stream, offset, \
+    def __init__(self, bear, offset):
+        Struct.__init__(self, bear, offset, \
                 [('flags', None)
                 ,('instanceStart', None)
                 ,('instanceSize', None)
@@ -115,15 +133,15 @@ class ClassRO(Struct):
                 return method
         raise AttributeError, name
 
-class MethodList(List):
-    def __init__(self, stream, offset):
-        List.__init__(self, stream, offset, Method)
+class MethodList(PropertyList):
+    def __init__(self, bear, offset):
+        PropertyList.__init__(self, bear, offset, Method)
 
 
 class Method(Struct):
 
-    def __init__(self, stream, offset):
-        Struct.__init__(self, stream, offset,
+    def __init__(self, bear, offset):
+        Struct.__init__(self, bear, offset,
                 [('cmd', String)
                 ,('method_type', String)
                 ,('imp', None)])
@@ -131,14 +149,14 @@ class Method(Struct):
     def __repr__(self):
         return self.cmd
 
-class IVarList(List):
-    def __init__(self, stream, offset):
-        List.__init__(self, stream, offset, IVar)
+class IVarList(PropertyList):
+    def __init__(self, bear, offset):
+        PropertyList.__init__(self, bear, offset, IVar)
 
 
 class IVar(Struct):
-    def __init__(self, stream, offset):
-        Struct.__init__(self, stream, offset,
+    def __init__(self, bear, offset):
+        Struct.__init__(self, bear, offset,
                 [('offset', None)
                 ,('name', String)
                 ,('type', String)
@@ -149,23 +167,10 @@ class IVar(Struct):
         return self.name
 
 
-def decompile(stream):
-    elf = ELFFile(stream)
-    #symbols = elf.get_section_by_name('.dynsym').iter_symbols()
-    #symbols = { x.entry.st_value: x.name for x in symbols }
-    #objc_data = elf.get_section_by_name('__DATA, __objc_data')
-    #assert objc_data is not None
-
-    classlist = get_classlist(elf)
-    for cls in get_classlist(elf):
-        if 'AddNew' in cls.name:
-            print cls.super.getRandomDotClass.method_type
-
-
-    #start = objc_data.header.sh_offset
-    #end = start + objc_data.header.sh_size
-    #for i in range(start, end, 20):
-    #    print hex(i), symbols[i]
+def decompile(bear):
+    criteria = lambda x: 'AddNew' in x.name and not x.is_metaclass()
+    cls, = filter(criteria, bear.by_class[Class])
+    print hex(cls.super.getRandomDotClass.imp)
 
 
 if __name__ == '__main__':
@@ -173,4 +178,4 @@ if __name__ == '__main__':
     if len(sys.argv) < 2:
         sys.stderr.write('usage: decompile.py </path/to/libsomething.so>\n')
     with open(sys.argv[1]) as lib:
-        decompile(lib)
+        decompile(FreezingBear(lib))
